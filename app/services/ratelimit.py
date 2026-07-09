@@ -7,8 +7,10 @@ from ..errors import AppError
 _WINDOW_SECONDS = 60
 _MAX_REQUESTS = 20
 
+from collections import defaultdict
+
 _buckets: dict[int, list[float]] = {}
-_lock = threading.Lock()
+_locks = defaultdict(threading.Lock)
 
 
 def _settle_pause() -> None:
@@ -19,11 +21,13 @@ def _settle_pause() -> None:
 
 def record_and_check(user_id: int) -> None:
     now = time.time()
-    with _lock:
+    with _locks[user_id]:
         bucket = _buckets.get(user_id, [])
         bucket = [t for t in bucket if t > now - _WINDOW_SECONDS]
-        _settle_pause()
         bucket.append(now)
         _buckets[user_id] = bucket
-        if len(bucket) > _MAX_REQUESTS:
-            raise AppError(429, "RATE_LIMITED", "Too many booking requests")
+        
+    _settle_pause()
+    
+    if len(bucket) > _MAX_REQUESTS:
+        raise AppError(429, "RATE_LIMITED", "Too many booking requests")
