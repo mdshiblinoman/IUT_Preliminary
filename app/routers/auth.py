@@ -1,7 +1,7 @@
 """Authentication endpoints: register, login, refresh, logout."""
 import threading
 from fastapi import APIRouter, Depends
-_refresh_lock = threading.Lock()
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..auth import (
@@ -14,14 +14,13 @@ from ..auth import (
     verify_password,
     _revoked_tokens,
 )
-from sqlalchemy.exc import IntegrityError
 from ..database import get_db
 from ..errors import AppError
 from ..models import Organization, User
 from ..schemas import LoginRequest, RefreshRequest, RegisterRequest
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-
+_refresh_lock = threading.Lock()
 
 @router.post("/register", status_code=201)
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
@@ -30,8 +29,13 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     if org is None:
         org = Organization(name=payload.org_name)
         db.add(org)
-        db.commit()
-        db.refresh(org)
+        try:
+            db.commit()
+            db.refresh(org)
+        except IntegrityError:
+            db.rollback()
+            org = db.query(Organization).filter(Organization.name == payload.org_name).first()
+            role = "member"
 
     existing = (
         db.query(User)
@@ -87,11 +91,12 @@ def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
     data = decode_token(payload.refresh_token)
     if data.get("type") != "refresh":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
-        
+    
     with _refresh_lock:
         if data.get("jti") in _revoked_tokens:
             raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
         _revoked_tokens.add(data["jti"])
+        
     user = db.query(User).filter(User.id == int(data["sub"])).first()
     if user is None:
         raise AppError(401, "UNAUTHORIZED", "Unknown user")

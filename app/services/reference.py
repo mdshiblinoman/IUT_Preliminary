@@ -19,6 +19,6 @@ def _format_pause() -> None:
 def next_reference_code() -> str:
     with _lock:
         current = _counter["value"]
+        _format_pause()
         _counter["value"] = current + 1
-    _format_pause()
-    return f"CW-{current:06d}"
+        return f"CW-{current:06d}"

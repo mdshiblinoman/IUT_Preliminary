@@ -1,16 +1,12 @@
 """Booking creation, listing, detail and cancellation."""
 import time
+import threading
+from collections import defaultdict
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from collections import defaultdict
-import threading
-
-_room_locks = defaultdict(threading.Lock)
-_user_locks = defaultdict(threading.Lock)
-_booking_locks = defaultdict(threading.Lock)
 
 from .. import cache
 from ..auth import get_current_user
@@ -29,6 +25,10 @@ MIN_DURATION_HOURS = 1
 MAX_DURATION_HOURS = 8
 QUOTA_LIMIT = 3
 QUOTA_WINDOW_HOURS = 24
+
+_room_locks = defaultdict(threading.Lock)
+_user_locks = defaultdict(threading.Lock)
+_booking_locks = defaultdict(threading.Lock)
 
 
 def _pricing_warmup() -> None:
@@ -84,9 +84,12 @@ def create_booking(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    # Release the read transaction started by get_current_user to avoid SQLite deadlocks
+    # and guarantee we fetch the most up-to-date data during concurrency.
     user_id = user.id
     user_org_id = user.org_id
     db.commit()
+
     ratelimit.record_and_check(user_id)
 
     start = parse_input_datetime(payload.start_time)
@@ -110,12 +113,12 @@ def create_booking(
             room = db.query(Room).filter(Room.id == payload.room_id, Room.org_id == user_org_id).first()
             if room is None:
                 raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
-        
+
             if _has_conflict(db, room.id, start, end):
                 raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
-        
+
             _check_quota(db, user_id, now, start)
-        
+
             price_cents = room.hourly_rate_cents * duration_hours
             booking = Booking(
                 room_id=room.id,
@@ -198,11 +201,12 @@ def cancel_booking(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    # Release the read transaction started by get_current_user
     user_id = user.id
     user_role = user.role
     user_org_id = user.org_id
     db.commit()
-    
+
     with _booking_locks[booking_id]:
         booking = (
             db.query(Booking)
@@ -214,24 +218,24 @@ def cancel_booking(
             raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
         if user_role != "admin" and booking.user_id != user_id:
             raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
-    
+
         if booking.status == "cancelled":
             raise AppError(409, "ALREADY_CANCELLED", "Booking already cancelled")
 
-    now = datetime.utcnow()
-    notice = booking.start_time - now
-    notice_hours = notice.total_seconds() / 3600
-    if notice_hours >= 48:
-        refund_percent = 100
-    elif notice_hours >= 24:
-        refund_percent = 50
-    else:
-        refund_percent = 0
+        now = datetime.utcnow()
+        notice = booking.start_time - now
+        notice_hours = notice.total_seconds() / 3600
+        if notice_hours >= 48:
+            refund_percent = 100
+        elif notice_hours >= 24:
+            refund_percent = 50
+        else:
+            refund_percent = 0
 
-    refund_amount_cents = int((booking.price_cents * refund_percent / 100.0) + 0.5)
+        refund_amount_cents = int((booking.price_cents * refund_percent / 100.0) + 0.5)
 
         log_refund(db, booking, refund_amount_cents)
-    
+
         _settlement_pause()
         booking.status = "cancelled"
         db.commit()
